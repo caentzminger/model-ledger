@@ -37,10 +37,29 @@ class HttpLedgerBackend:
         # cannot reverse-resolve on writes like set_tag. Populated lazily
         # whenever a name lookup succeeds (get_model_by_name, save_model, etc.).
         self._hash_to_name: dict[str, str] = {}
+        # Hashes whose registration event was already logged server-side by
+        # save_model's POST /record — append_snapshot must not repost it.
+        self._registered_hashes: set[str] = set()
+        # Snapshots appended through this backend, kept for get_snapshot()
+        # round-trips (the REST API has no snapshot-by-hash endpoint).
+        self._snapshot_cache: dict[str, Snapshot] = {}
 
     # ── Models ──
 
-    def save_model(self, model: ModelRef) -> None:
+    def register_model(
+        self,
+        model: ModelRef,
+        *,
+        payload: dict[str, Any] | None = None,
+        actor: str = "system",
+    ) -> None:
+        """Register a model server-side in a single POST /record.
+
+        ``Ledger.register()`` dispatches here instead of the two-step
+        save_model + append_snapshot, so the caller's registration payload,
+        tier, and actor reach the server (the server's record tool logs the
+        single ``registered`` event itself).
+        """
         resp = self._client.post(
             "/record",
             json={
@@ -49,7 +68,9 @@ class HttpLedgerBackend:
                 "owner": model.owner,
                 "model_type": model.model_type,
                 "purpose": model.purpose,
-                "payload": {},
+                "tier": model.tier,
+                "actor": actor,
+                "payload": payload or {},
             },
         )
         # Fail loudly on HTTP errors rather than caching a model that was
@@ -71,6 +92,13 @@ class HttpLedgerBackend:
             )
         model.model_hash = server_hash
         self._hash_to_name[server_hash] = model.name
+        # The server's /record tool logs the "registered" event as part of
+        # registration — remember that so any follow-up
+        # append_snapshot(registered) is not posted a second time.
+        self._registered_hashes.add(server_hash)
+
+    def save_model(self, model: ModelRef) -> None:
+        self.register_model(model)
 
     def get_model(self, model_hash: str) -> ModelRef | None:
         name = self._hash_to_name.get(model_hash)
@@ -108,20 +136,24 @@ class HttpLedgerBackend:
         data = resp.json()
         models = []
         for m in data.get("models", []):
-            models.append(
-                ModelRef(
-                    name=m["name"],
-                    owner=m.get("owner") or "unknown",
-                    model_type=m.get("model_type") or "unknown",
-                    tier="unclassified",
-                    purpose="",
-                    status=m.get("status") or "active",
-                )
+            ref = ModelRef(
+                name=m["name"],
+                owner=m.get("owner") or "unknown",
+                model_type=m.get("model_type") or "unknown",
+                tier="unclassified",
+                purpose="",
+                status=m.get("status") or "active",
             )
+            # ModelSummary omits created_at, so this hash is a client-local
+            # placeholder that changes on every call. Cache the name mapping
+            # so hashes handed out here stay resolvable by get_model /
+            # list_snapshots within this process (e.g. batch_platforms).
+            self._hash_to_name[ref.model_hash] = ref.name
+            models.append(ref)
         return models
 
     def update_model(self, model: ModelRef) -> None:
-        self._client.post(
+        resp = self._client.post(
             "/record",
             json={
                 "model_name": model.name,
@@ -129,22 +161,53 @@ class HttpLedgerBackend:
                 "payload": {"status": model.status},
             },
         )
+        resp.raise_for_status()
 
     # ── Snapshots ──
 
+    def _resolve_name(self, model_hash: str) -> str:
+        """Resolve a model_hash to its server-side name, or fail loudly."""
+        name = self._hash_to_name.get(model_hash)
+        if name is not None:
+            return name
+        model = self.get_model(model_hash)
+        if model is not None:
+            return model.name
+        raise ModelNotFoundError(model_hash)
+
     def append_snapshot(self, snapshot: Snapshot) -> None:
-        self._client.post(
+        if snapshot.event_type == "registered" and snapshot.model_hash in self._registered_hashes:
+            # save_model's POST /record already logged this registration
+            # server-side; posting it again would duplicate the event.
+            self._registered_hashes.discard(snapshot.model_hash)
+            return
+        resp = self._client.post(
             "/record",
             json={
-                "model_name": "",  # resolved server-side
+                "model_name": self._resolve_name(snapshot.model_hash),
                 "event": snapshot.event_type,
                 "payload": snapshot.payload,
                 "actor": snapshot.actor,
             },
         )
+        resp.raise_for_status()
+        self._snapshot_cache[snapshot.snapshot_hash] = snapshot
 
     def get_snapshot(self, snapshot_hash: str) -> Snapshot | None:
-        # Not directly exposed via REST — return None
+        cached = self._snapshot_cache.get(snapshot_hash)
+        if cached is not None:
+            return cached
+        # The REST API has no snapshot-by-hash endpoint, so scan the
+        # changelog of every model resolved so far. Snapshot hashes are
+        # content-derived (model_hash + timestamp + payload), which means
+        # hashes rebuilt here match SERVER-minted identities. Snapshots
+        # created client-side by Ledger.record() carry a client timestamp,
+        # so their hashes are process-local: resolvable through this
+        # backend's _snapshot_cache, but not from another client.
+        for model_hash in list(self._hash_to_name):
+            for snap in self.list_snapshots(model_hash):
+                if snap.snapshot_hash == snapshot_hash:
+                    return snap
         return None
 
     def list_snapshots(self, model_hash: str, **filters: str) -> list[Snapshot]:
@@ -152,7 +215,14 @@ class HttpLedgerBackend:
         model = self.get_model(model_hash)
         if not model:
             return []
-        params: dict[str, Any] = {"model_name": model.name, "limit": 10000}
+        # The changelog tool defaults to a 7-day window when no bounds are
+        # given; list_snapshots must return the model's FULL history, so pass
+        # an explicit all-time lower bound.
+        params: dict[str, Any] = {
+            "model_name": model.name,
+            "limit": 10000,
+            "since": "1970-01-01T00:00:00+00:00",
+        }
         if "event_type" in filters:
             params["event_type"] = filters["event_type"]
         resp = self._client.get("/changelog", params=params)

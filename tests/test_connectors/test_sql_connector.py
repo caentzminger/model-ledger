@@ -334,3 +334,96 @@ def test_integrates_with_ledger():
     ledger.add(reader_conn.discover())
     result = ledger.connect()
     assert result["links_created"] >= 1
+
+
+class TestDictRowRequirement:
+    """Connections returning tuple rows must fail with a clear error."""
+
+    def test_tuple_rows_raise_clear_type_error(self, tmp_path):
+        import sqlite3
+
+        import pytest
+
+        db = tmp_path / "registry.db"
+        conn = sqlite3.connect(db)  # default row factory: tuples
+        conn.execute("CREATE TABLE models (name TEXT, owner TEXT)")
+        conn.execute("INSERT INTO models VALUES ('model_a', 'alice')")
+        conn.commit()
+
+        c = sql_connector(
+            name="registry",
+            connection=conn,
+            query="SELECT name, owner FROM models",
+            name_column="name",
+        )
+        with pytest.raises(TypeError, match="dict-style rows"):
+            c.discover()
+        conn.close()
+
+    def test_dict_row_factory_works(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "registry.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE models (name TEXT, owner TEXT)")
+        conn.execute("INSERT INTO models VALUES ('model_a', 'alice')")
+        conn.commit()
+        conn.row_factory = lambda cursor, row: {
+            d[0]: row[i] for i, d in enumerate(cursor.description)
+        }
+
+        c = sql_connector(
+            name="registry",
+            connection=conn,
+            query="SELECT name, owner FROM models",
+            name_column="name",
+        )
+        nodes = c.discover()
+        assert nodes[0].name == "model_a"
+        assert nodes[0].metadata["owner"] == "alice"
+        conn.close()
+
+    def test_sqlite3_row_factory_works(self, tmp_path):
+        """sqlite3.Row is name-addressable (keys() + row["col"]) but has no
+        .get() — the stdlib's own mapping-style row type must be accepted."""
+        import sqlite3
+
+        db = tmp_path / "registry.db"
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE models (name TEXT, owner TEXT)")
+        conn.execute("INSERT INTO models VALUES ('model_a', 'alice')")
+        conn.commit()
+
+        c = sql_connector(
+            name="registry",
+            connection=conn,
+            query="SELECT name, owner FROM models",
+            name_column="name",
+        )
+        nodes = c.discover()
+        assert nodes[0].name == "model_a"
+        # Auto-metadata mode consumes unmapped columns from the row too.
+        assert nodes[0].metadata["owner"] == "alice"
+        conn.close()
+
+    def test_sqlite3_row_with_empty_metadata_columns(self, tmp_path):
+        import sqlite3
+
+        db = tmp_path / "registry.db"
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE models (name TEXT)")
+        conn.execute("INSERT INTO models VALUES ('m1')")
+        conn.commit()
+
+        c = sql_connector(
+            name="reg",
+            connection=conn,
+            query="SELECT name FROM models",
+            name_column="name",
+            metadata_columns={},
+        )
+        nodes = c.discover()
+        assert nodes[0].name == "m1"
+        conn.close()

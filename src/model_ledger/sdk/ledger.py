@@ -77,6 +77,16 @@ class Ledger:
         self._cache_complete = False  # True after bulk preload — skip individual lookups
         self._node_cache: list = []  # DataNodes from add() — reused by connect()
 
+    @property
+    def backend(self) -> LedgerBackend:
+        """The storage backend this ledger reads from and writes to.
+
+        Public accessor for tool functions and integrations that dispatch on
+        optional backend capabilities (``batch_platforms``, ``changelog_page``,
+        ...) — avoids reaching into the private ``_backend`` attribute.
+        """
+        return self._backend
+
     @classmethod
     def from_sqlite(cls, db_path: str) -> Ledger:
         """Create a Ledger backed by a SQLite database.
@@ -146,7 +156,13 @@ class Ledger:
         status: str = "active",
         actor: str = "system",
         metadata: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
     ) -> ModelRef:
+        """Register a model, logging exactly one ``registered`` event.
+
+        ``payload`` entries are merged into the registration event's payload
+        on top of the canonical identity fields (caller keys win).
+        """
         if name in self._name_cache:
             return self._name_cache[name]
         if not self._cache_complete:
@@ -164,21 +180,31 @@ class Ledger:
             status=status,
             metadata=metadata or {},
         )
-        self._backend.save_model(model)
-        self._backend.append_snapshot(
-            Snapshot(
-                model_hash=model.model_hash,
-                actor=actor,
-                event_type="registered",
-                payload={
-                    "name": name,
-                    "owner": owner,
-                    "tier": tier,
-                    "purpose": purpose,
-                    "model_origin": model_origin,
-                },
+        register_model = getattr(self._backend, "register_model", None)
+        if callable(register_model):
+            # Pass-through backends (e.g. HttpLedgerBackend) register in a
+            # single call so the payload, tier, and actor reach the remote
+            # server, which logs the single "registered" event itself.
+            register_model(model, payload=payload or {}, actor=actor)
+        else:
+            self._backend.save_model(model)
+            event_payload: dict[str, Any] = {
+                "name": name,
+                "owner": owner,
+                "tier": tier,
+                "purpose": purpose,
+                "model_origin": model_origin,
+            }
+            if payload:
+                event_payload.update(payload)
+            self._backend.append_snapshot(
+                Snapshot(
+                    model_hash=model.model_hash,
+                    actor=actor,
+                    event_type="registered",
+                    payload=event_payload,
+                )
             )
-        )
         self._name_cache[name] = model
         return model
 

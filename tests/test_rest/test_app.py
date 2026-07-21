@@ -260,3 +260,70 @@ class TestDiscoverEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         assert data["models_added"] == 2
+
+
+class TestCreateAppBackendGuard:
+    """create_app validates the backend at construction, not first request."""
+
+    def test_rejects_ledger_instance(self):
+        from model_ledger.sdk.ledger import Ledger
+
+        with pytest.raises(TypeError, match="LedgerBackend"):
+            create_app(backend=Ledger())
+
+    def test_rejects_arbitrary_object(self):
+        with pytest.raises(TypeError, match="LedgerBackend"):
+            create_app(backend="./ledger.db")
+
+    def test_accepts_real_backend(self):
+        from model_ledger.backends.ledger_memory import InMemoryLedgerBackend
+
+        app = create_app(backend=InMemoryLedgerBackend())
+        assert TestClient(app).get("/overview").status_code == 200
+
+    def test_accepts_partial_custom_backend(self):
+        """Duck typing, not full-protocol isinstance: a handwritten backend
+        that skips optional methods (list_snapshots_before, tags) worked on
+        0.7.12 and must keep working."""
+        from model_ledger.backends.ledger_memory import InMemoryLedgerBackend
+
+        class PartialBackend:
+            def __init__(self):
+                self._i = InMemoryLedgerBackend()
+
+            def save_model(self, m):
+                return self._i.save_model(m)
+
+            def get_model(self, h):
+                return self._i.get_model(h)
+
+            def get_model_by_name(self, n):
+                return self._i.get_model_by_name(n)
+
+            def list_models(self, **f):
+                return self._i.list_models(**f)
+
+            def update_model(self, m):
+                return self._i.update_model(m)
+
+            def append_snapshot(self, s):
+                return self._i.append_snapshot(s)
+
+            def get_snapshot(self, h):
+                return self._i.get_snapshot(h)
+
+            def list_snapshots(self, h, **f):
+                return self._i.list_snapshots(h, **f)
+
+            def latest_snapshot(self, h, tag=None):
+                return self._i.latest_snapshot(h, tag)
+
+            # deliberately missing: list_snapshots_before, set_tag,
+            # get_tag, list_tags
+
+        app = create_app(backend=PartialBackend())
+        assert TestClient(app).get("/overview").status_code == 200
+
+    def test_rejects_object_missing_core_methods(self):
+        with pytest.raises(TypeError, match="LedgerBackend"):
+            create_app(backend=object())
