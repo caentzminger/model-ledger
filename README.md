@@ -29,7 +29,13 @@ models and 212k events runs in under a second ([CHANGELOG, v0.7.4](CHANGELOG.md)
 ## Install
 
 ```bash
-pip install model-ledger
+uv pip install model-ledger
+```
+```bash
+uv add model-ledger
+```
+```bash
+uv tool install git+https://github.com/caentzminger/model-ledger[cli]
 ```
 
 ## The graph builds itself
